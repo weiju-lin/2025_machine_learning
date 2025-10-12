@@ -1,0 +1,234 @@
+import xml.etree.ElementTree as ET
+import numpy as np
+import pandas as pd
+import re
+
+from sklearn.model_selection import train_test_split
+from sklearn.kernel_approximation import RBFSampler
+from sklearn.pipeline import make_pipeline
+from sklearn.preprocessing import StandardScaler
+from sklearn.linear_model import LogisticRegression, Ridge
+from sklearn.metrics import mean_squared_error, confusion_matrix, ConfusionMatrixDisplay, r2_score
+import matplotlib.pyplot as plt
+
+def read_cwa_grid(xml_path, dx=0.03):
+    ns = {'cwa': 'urn:cwa:gov:tw:cwacommon:0.1'}
+    root = ET.parse(xml_path).getroot()
+
+    blon = float(root.find('.//cwa:BottomLeftLongitude', ns).text)   # 120.00
+    tlon = float(root.find('.//cwa:TopRightLongitude',  ns).text)    # 121.98
+    blat = float(root.find('.//cwa:BottomLeftLatitude', ns).text)    # 21.88
+    tlat = float(root.find('.//cwa:TopRightLatitude',   ns).text)    # 25.45
+
+    nx = int(round((tlon - blon) / dx)) + 1  # 67
+    ny = int(round((tlat - blat) / dx)) + 1  # 120
+
+    node = root.find('.//cwa:Content', ns)
+    txt = node.text
+
+    patt = r'[+\-]?(?:\d+(?:\.\d*)?|\.\d+)(?:[Ee][+\-]?\d+)?'
+    tokens = re.findall(patt, txt)
+    vals = np.array(list(map(float, tokens)), dtype=np.float64)
+
+    expected = nx * ny
+    grid = vals.reshape(ny, nx)
+
+    lons = blon + np.arange(nx) * dx
+    lats = blat + np.arange(ny) * dx
+
+    lon_grid, lat_grid = np.meshgrid(lons, lats)
+    return grid, lon_grid, lat_grid
+
+xml_path = "O-A0038-003.xml"
+grid, lon_grid, lat_grid = read_cwa_grid(xml_path)
+
+NOVAL = -999.0
+
+#Classification dataset
+label = (grid != NOVAL).astype(np.int8)
+df_cls = pd.DataFrame({
+    "lon": lon_grid.ravel(),
+    "lat": lat_grid.ravel(),
+    "label": label.ravel()
+})
+
+#Regression dataset
+mask = (grid != NOVAL)
+df_reg = pd.DataFrame({
+    "lon": lon_grid[mask].ravel(),
+    "lat": lat_grid[mask].ravel(),
+    "value": grid[mask].ravel().astype(np.float32)
+})
+
+df_cls.to_csv("classification.csv", index=False, float_format="%.5f")
+df_reg.to_csv("regression.csv", index=False, float_format="%.5f")
+
+#Classification model
+Xc = df_cls[["lon","lat"]].values
+yc = df_cls["label"].values
+Xc_tr, Xc_te, yc_tr, yc_te = train_test_split(Xc, yc, test_size=0.2, stratify=yc, random_state=42)
+
+pipe_rbf_cls = make_pipeline(
+    RBFSampler(gamma=1.0, n_components=500, random_state=42),
+    StandardScaler(),
+    LogisticRegression(max_iter=2000, class_weight="balanced")
+)
+
+pipe_rbf_cls.fit(Xc_tr, yc_tr)
+
+#Regression model
+Xr = df_reg[["lon","lat"]].values
+yr = df_reg["value"].values
+Xr_tr, Xr_te, yr_tr, yr_te = train_test_split(Xr, yr, test_size=0.2, random_state=42)
+
+pipe_rbf_reg = make_pipeline(
+    RBFSampler(gamma=100.0, n_components=500, random_state=42),
+    StandardScaler(),
+    Ridge(alpha=1.0)
+)
+
+pipe_rbf_reg.fit(Xr_tr, yr_tr)
+yr_pred = pipe_rbf_reg.predict(Xr_te)
+
+plt.figure(figsize=(12,5))
+
+#Classification labels distribution
+plt.subplot(1,2,1)
+plt.scatter(df_cls["lon"], df_cls["lat"], c=df_cls["label"], cmap="bwr", s=10, alpha=0.7)
+plt.colorbar(label="Label (0=Invalid, 1=Valid)")
+plt.title("Classification Data Distribution (True)")
+plt.xlabel("Longitude")
+plt.ylabel("Latitude")
+
+#Regression values distribution
+plt.subplot(1,2,2)
+sc = plt.scatter(df_reg["lon"], df_reg["lat"], c=df_reg["value"], cmap="coolwarm", s=10, alpha=0.7)
+plt.colorbar(sc, label="Temperature (°C)")
+plt.title("Regression Data Distribution (True)")
+plt.xlabel("Longitude")
+plt.ylabel("Latitude")
+plt.show()
+
+#Classification results
+Xc = df_cls[["lon","lat"]].values
+yc = df_cls["label"].values
+Xc_tr, Xc_te, yc_tr, yc_te = train_test_split(Xc, yc, test_size=0.2, stratify=yc, random_state=42)
+
+pipe_rbf_cls = make_pipeline(
+    RBFSampler(gamma=1.0, n_components=500, random_state=42),
+    StandardScaler(),
+    LogisticRegression(max_iter=2000, class_weight="balanced")
+)
+pipe_rbf_cls.fit(Xc_tr, yc_tr)
+
+y_pred_cls = pipe_rbf_cls.predict(Xc_te)
+
+plt.figure(figsize=(12,5))
+plt.subplot(1,2,1)
+plt.scatter(Xc_te[:,0], Xc_te[:,1], c=yc_te, cmap="bwr", s=10, alpha=0.7)
+plt.title("Classification - Test Set True Labels")
+plt.xlabel("Longitude")
+plt.ylabel("Latitude")
+
+plt.subplot(1,2,2)
+plt.scatter(Xc_te[:,0], Xc_te[:,1], c=y_pred_cls, cmap="bwr", s=10, alpha=0.7)
+plt.title("Classification - Model Predicted Labels (RBF features)")
+plt.xlabel("Longitude")
+plt.ylabel("Latitude")
+plt.show()
+
+#Confusion matrix
+cm = confusion_matrix(yc_te, y_pred_cls)
+disp = ConfusionMatrixDisplay(confusion_matrix=cm, display_labels=[0,1])
+disp.plot(cmap="Blues", values_format="d")
+plt.title("Classification - Confusion Matrix (RBF features)")
+plt.show()
+
+#Regression results
+Xr = df_reg[["lon","lat"]].values
+yr = df_reg["value"].values
+Xr_tr, Xr_te, yr_tr, yr_te = train_test_split(Xr, yr, test_size=0.2, random_state=42)
+
+pipe_rbf_reg = make_pipeline(
+    RBFSampler(gamma=100.0, n_components=500, random_state=42),
+    StandardScaler(),
+    Ridge(alpha=1.0)
+)
+pipe_rbf_reg.fit(Xr_tr, yr_tr)
+yr_pred = pipe_rbf_reg.predict(Xr_te)
+
+#Scatter: true vs predicted
+plt.figure(figsize=(6,6))
+plt.scatter(yr_te, yr_pred, alpha=0.5, s=10)
+plt.plot([yr_te.min(), yr_te.max()], [yr_te.min(), yr_te.max()], "r--")
+plt.xlabel("True Temperature (°C)")
+plt.ylabel("Predicted Temperature (°C)")
+plt.title("Regression - True vs Predicted Values (RBF features)")
+plt.show()
+
+#Report metrics
+r2 = r2_score(yr_te, yr_pred)
+mse = mean_squared_error(yr_te, yr_pred)
+print(f"Classification Accuracy (RBF features): {pipe_rbf_cls.score(Xc_te, yc_te):.3f}")
+print(f"Regression R² (RBF features): {r2:.3f}")
+print(f"Regression MSE (RBF features): {mse:.3f}")
+
+#==================== Append: Piecewise regression h(x) ====================
+
+#define h(x) as required
+def h_predict(X, classifier, regressor, noval=-999.0):
+    c = classifier.predict(X) #C(x)
+    out = np.full(c.shape[0], noval, float) #-999
+    idx = (c == 1)
+    if np.any(idx):
+        out[idx] = regressor.predict(X[idx]) #R(x) on valid
+    return out
+
+#evaluate h(x) on the regression test set
+#only compute the points with C(x)=1
+Xr_te_exists = 'Xr_te' in globals() and 'yr_te' in globals()
+
+pred_piece_te = h_predict(Xr_te, pipe_rbf_cls, pipe_rbf_reg, NOVAL)
+mask_eval = (pred_piece_te != NOVAL)
+
+coverage = mask_eval.mean()  #ratio of test points predicted as valid
+print(f"[Piecewise] Coverage on regression test set (C(x)=1 ratio): {coverage:.3f}")
+
+#plot piecewise model
+from matplotlib.colors import Normalize
+
+all_xy = np.c_[lon_grid.ravel(), lat_grid.ravel()]
+piece_all = h_predict(all_xy, pipe_rbf_cls, pipe_rbf_reg, NOVAL).reshape(lon_grid.shape)
+
+vals = piece_all.ravel()
+mask_invalid = (vals == NOVAL) #points predicted as -999
+mask_valid   = ~mask_invalid   #points with continuous prediction
+
+norm = Normalize(vmin=0, vmax=30)
+
+plt.figure(figsize=(5,5))
+
+#plot invalid points
+plt.scatter(
+    all_xy[mask_invalid, 0], all_xy[mask_invalid, 1],
+    s=8, alpha=1.0, c='gray', label='Invalid (-999)'
+)
+
+#plot valid points using a continuous colormap with the fixed 0–30°C range
+sc = plt.scatter(
+    all_xy[mask_valid, 0], all_xy[mask_valid, 1],
+    c=vals[mask_valid],
+    s=8, alpha=1.0, cmap='coolwarm', norm=norm, label='Valid (0–30°C)'
+)
+
+#attach a colorbar only for the valid layer so -999 does not affect the scale
+cbar = plt.colorbar(sc)
+cbar.set_label("Temperature (°C)")
+cbar.set_ticks([0, 5, 10, 15, 20, 25, 30])
+
+plt.legend(loc='upper right', frameon=True)
+plt.title("Piecewise Model h(x)")
+plt.xlabel("Longitude")
+plt.ylabel("Latitude")
+plt.tight_layout()
+plt.show()
